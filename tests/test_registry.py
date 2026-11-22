@@ -20,6 +20,18 @@ def test_seed_import_search_and_detail(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert [item["id"] for item in response.json()] == ["nyc-open-data"]
 
+    agency_response = client.get("/v1/apis", params={"agency": "City of New York"})
+    assert agency_response.status_code == 200
+    assert [item["id"] for item in agency_response.json()] == ["nyc-open-data"]
+
+    filtered_stats = client.get(
+        "/v1/statistics",
+        params={"jurisdiction": "state", "agency": "State of New York"},
+    )
+    assert filtered_stats.status_code == 200
+    assert filtered_stats.json()["apis"] > 0
+    assert filtered_stats.json()["sources"] == 1
+
     detail = client.get("/v1/apis/nyc-open-data")
     assert detail.status_code == 200
     assert detail.json()["agency"] == "City of New York"
@@ -36,6 +48,12 @@ def test_seed_import_search_and_detail(tmp_path: Path) -> None:
     assert "datagov-catalog-source" not in [item["id"] for item in default_list.json()]
     datagov_list = client.get("/v1/apis", params={"source_id": "data-gov"})
     assert datagov_list.status_code == 200
+
+    all_records = client.get("/v1/records", params={"limit": 500})
+    assert all_records.status_code == 200
+    assert isinstance(all_records.json(), list)
+    record_types = {item["record_type"] for item in all_records.json()}
+    assert "api" in record_types
     sources = client.get("/v1/source-facets")
     assert sources.status_code == 200
     assert any(item["source_id"] == "data-gov" for item in sources.json())

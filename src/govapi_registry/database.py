@@ -1,4 +1,4 @@
-"""SQLite persistence and read/write operations for the registry."""
+"""SQLite persistence and read-write operations for the registry."""
 
 import json
 import sqlite3
@@ -84,6 +84,25 @@ class RegistryDatabase:
                 )
             """)
             connection.execute("""
+                DELETE FROM api_source_references
+                WHERE rowid NOT IN (
+                    SELECT MIN(rowid)
+                    FROM api_source_references
+                    GROUP BY api_record_id,
+                             COALESCE(source_url, ''),
+                             COALESCE(source_record_id, '')
+                )
+            """)
+            connection.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_api_source_references
+                ON api_source_references (
+                    api_record_id,
+                    source_id,
+                    COALESCE(source_record_id, ''),
+                    COALESCE(source_url, '')
+                )
+            """)
+            connection.execute("""
                 CREATE TABLE IF NOT EXISTS discovery_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     source_id TEXT NOT NULL,
@@ -154,6 +173,57 @@ class RegistryDatabase:
                 if name not in existing:
                     connection.execute(f"ALTER TABLE api_records ADD COLUMN {name} {declaration}")
 
+            migrated = connection.execute("""
+                    SELECT *
+                    FROM api_records
+                    WHERE source_id = 'data-gov'
+                      AND (record_type IS NULL OR record_type = 'api')
+                      AND lower(base_url) LIKE '%.json%'
+            """).fetchall()
+            for row in migrated:
+                    data = dict(row)
+                    connection.execute(
+                        "UPDATE api_records SET record_type = 'dataset', updated_at = ? WHERE id = ?",
+                        (self._utc_now(), data["id"]),
+                    )
+                    connection.execute("""
+                        INSERT INTO datasets (
+                            id, title, description, agency, jurisdiction, country, category,
+                            landing_page, download_url, formats, license, source_id,
+                            source_record_id, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            title=excluded.title,
+                            description=excluded.description,
+                            agency=excluded.agency,
+                            jurisdiction=excluded.jurisdiction,
+                            country=excluded.country,
+                            category=excluded.category,
+                            landing_page=excluded.landing_page,
+                            download_url=excluded.download_url,
+                            formats=excluded.formats,
+                            license=excluded.license,
+                            source_id=excluded.source_id,
+                            source_record_id=excluded.source_record_id,
+                            updated_at=excluded.updated_at
+                    """, (
+                        data["id"],
+                        data["name"],
+                        None,
+                        data["agency"],
+                        data["jurisdiction"],
+                        data["country"],
+                        data["category"],
+                        data["documentation_url"] or data["source_url"],
+                        data["base_url"],
+                        data["data_format"],
+                        data["license"],
+                        data["source_id"],
+                        data["source_record_id"],
+                        data["created_at"],
+                        data["updated_at"],
+                    ))
+
     # ------------------------------------------------------------------
     # API records
     # ------------------------------------------------------------------
@@ -220,14 +290,24 @@ class RegistryDatabase:
             """, {**values, "created_at": created_at, "updated_at": now})
 
             connection.execute("""
+                DELETE FROM api_source_references
+                WHERE api_record_id = ?
+                  AND COALESCE(source_url, '') = COALESCE(?, '')
+                  AND (
+                      (? IS NULL AND source_record_id IS NULL)
+                      OR source_record_id = ?
+                  )
+            """, (
+                canonical_record_id,
+                str(record.source_url),
+                record.source_record_id,
+                record.source_record_id,
+            ))
+            connection.execute("""
                 INSERT INTO api_source_references (
                     api_record_id, source_id, source_record_id, source_url,
                     discovered_at, last_seen_at
                 ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(api_record_id, source_id, source_record_id) DO UPDATE SET
-                    source_url=excluded.source_url,
-                    discovered_at=COALESCE(excluded.discovered_at, api_source_references.discovered_at),
-                    last_seen_at=excluded.last_seen_at
             """, (
                 canonical_record_id,
                 record.source_id,
@@ -236,6 +316,45 @@ class RegistryDatabase:
                 values["discovered_at"],
                 values["last_seen_at"],
             ))
+
+            if record.record_type == "dataset":
+                connection.execute("""
+                    INSERT INTO datasets (
+                        id, title, description, agency, jurisdiction, country, category,
+                        landing_page, download_url, formats, license, source_id,
+                        source_record_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        title=excluded.title,
+                        description=excluded.description,
+                        agency=excluded.agency,
+                        jurisdiction=excluded.jurisdiction,
+                        country=excluded.country,
+                        category=excluded.category,
+                        landing_page=excluded.landing_page,
+                        download_url=excluded.download_url,
+                        formats=excluded.formats,
+                        license=excluded.license,
+                        source_id=excluded.source_id,
+                        source_record_id=excluded.source_record_id,
+                        updated_at=excluded.updated_at
+                """, (
+                    canonical_record_id,
+                    record.name,
+                    None,
+                    record.agency,
+                    record.jurisdiction.value,
+                    record.country,
+                    record.category,
+                    str(record.documentation_url),
+                    str(record.base_url),
+                    values["data_format"],
+                    str(record.license) if record.license else None,
+                    record.source_id,
+                    record.source_record_id,
+                    created_at,
+                    now,
+                ))
 
         return self.get(canonical_record_id)  # type: ignore[return-value]
 
@@ -305,11 +424,23 @@ class RegistryDatabase:
     def list_source_references(self, api_record_id: str):
         with self.connect() as connection:
             rows = connection.execute("""
-                SELECT source_id, source_record_id, source_url, discovered_at, last_seen_at
+                SELECT
+                    source_id,
+                    source_record_id,
+                    source_url,
+                    discovered_at,
+                    last_seen_at
                 FROM api_source_references
                 WHERE api_record_id = ?
-                ORDER BY source_id, source_record_id
-            """, (api_record_id,)).fetchall()
+                  AND rowid IN (
+                      SELECT MIN(rowid)
+                      FROM api_source_references
+                      WHERE api_record_id = ?
+                      GROUP BY COALESCE(source_url, ''),
+                               COALESCE(source_record_id, '')
+                  )
+                ORDER BY source_url, source_id, source_record_id
+            """, (api_record_id, api_record_id)).fetchall()
         return [dict(row) for row in rows]
 
     def set_openapi_spec(self, api_record_id: str, spec_url: str) -> None:
@@ -394,6 +525,7 @@ class RegistryDatabase:
         q: str | None = None,
         jurisdiction: str | None = None,
         category: str | None = None,
+        agency: str | None = None,
         record_type: str | None = None,
         source_id: str | None = None,
         limit: int = 100,
@@ -402,20 +534,23 @@ class RegistryDatabase:
         clauses: list[str] = []
         params: list[object] = []
         if q:
-            clauses.append("(name LIKE ? OR agency LIKE ? OR category LIKE ?)")
+            clauses.append("(name LIKE ? OR agency LIKE ? OR category LIKE ? OR jurisdiction LIKE ? OR source_id LIKE ?)")
             needle = f"%{q}%"
-            params.extend([needle, needle, needle])
+            params.extend([needle, needle, needle, needle, needle])
         if jurisdiction:
             clauses.append("jurisdiction = ?")
             params.append(jurisdiction)
         if category:
             clauses.append("category = ?")
             params.append(category)
+        if agency:
+            clauses.append("agency = ?")
+            params.append(agency)
         if record_type:
             clauses.append("record_type = ?")
             params.append(record_type)
         else:
-            clauses.append("(record_type IS NULL OR record_type != 'catalog')")
+            clauses.append("(record_type IS NULL OR record_type = 'api')")
         if source_id:
             clauses.append("source_id = ?")
             params.append(source_id)
@@ -428,6 +563,73 @@ class RegistryDatabase:
                 params,
             ).fetchall()
         return [record for row in rows if (record := self._to_record(row))]
+
+    def list_records(
+        self,
+        *,
+        q: str | None = None,
+        jurisdiction: str | None = None,
+        category: str | None = None,
+        agency: str | None = None,
+        source_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ):
+        api_clauses: list[str] = ["(record_type IS NULL OR record_type IN ('api', 'catalog'))"]
+        api_params: list[object] = []
+        dataset_clauses: list[str] = []
+        dataset_params: list[object] = []
+
+        for where_clauses, params, name_expression, dataset_mode in (
+            (api_clauses, api_params, "(name LIKE ? OR agency LIKE ? OR category LIKE ? OR jurisdiction LIKE ? OR source_id LIKE ?)", False),
+            (dataset_clauses, dataset_params, "(title LIKE ? OR agency LIKE ? OR category LIKE ? OR jurisdiction LIKE ? OR source_id LIKE ?)", True),
+        ):
+            if q:
+                where_clauses.append(name_expression)
+                params.extend([f"%{q}%"] * 5)
+            if jurisdiction:
+                where_clauses.append("jurisdiction = ?")
+                params.append(jurisdiction)
+            if category:
+                where_clauses.append("category = ?")
+                params.append(category)
+            if agency:
+                where_clauses.append("agency = ?")
+                params.append(agency)
+            if source_id:
+                where_clauses.append("source_id = ?")
+                params.append(source_id)
+
+        api_where = f"WHERE {' AND '.join(api_clauses)}"
+        dataset_where = f"WHERE {' AND '.join(dataset_clauses)}" if dataset_clauses else ""
+        with self.connect() as connection:
+            rows = connection.execute(f"""
+                SELECT id, name, agency, jurisdiction, category, base_url,
+                       documentation_url, authentication, data_format, license,
+                       status, source_url, source_id, verification_status,
+                       'api' AS record_type, created_at, updated_at
+                FROM api_records
+                {api_where}
+                UNION ALL
+                SELECT id, title AS name, agency, jurisdiction,
+                       category, download_url AS base_url, landing_page AS documentation_url,
+                       'unknown' AS authentication, formats AS data_format, license,
+                       'unknown' AS status, landing_page AS source_url, source_id,
+                       'unverified' AS verification_status,
+                       'dataset' AS record_type, created_at, updated_at
+                FROM datasets
+                {dataset_where}
+                ORDER BY name
+                LIMIT ? OFFSET ?
+            """, api_params + dataset_params + [limit, offset]).fetchall()
+
+        results: list[dict] = []
+        for row in rows:
+            data = dict(row)
+            data["data_format"] = json.loads(data["data_format"]) if isinstance(data["data_format"], str) else data["data_format"]
+            data["authentication"] = data["authentication"] if data["authentication"] else "unknown"
+            results.append(data)
+        return results
 
     def count(self) -> int:
         with self.connect() as connection:
@@ -504,21 +706,25 @@ class RegistryDatabase:
         q: str | None = None,
         jurisdiction: str | None = None,
         category: str | None = None,
+        agency: str | None = None,
         source_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ):
         clauses, params = [], []
         if q:
-            clauses.append("(title LIKE ? OR agency LIKE ? OR category LIKE ?)")
+            clauses.append("(title LIKE ? OR agency LIKE ? OR category LIKE ? OR jurisdiction LIKE ? OR source_id LIKE ?)")
             needle = f"%{q}%"
-            params += [needle, needle, needle]
+            params += [needle, needle, needle, needle, needle]
         if jurisdiction:
             clauses.append("jurisdiction = ?")
             params.append(jurisdiction)
         if category:
             clauses.append("category = ?")
             params.append(category)
+        if agency:
+            clauses.append("agency = ?")
+            params.append(agency)
         if source_id:
             clauses.append("source_id = ?")
             params.append(source_id)
@@ -573,14 +779,136 @@ class RegistryDatabase:
     # Registry statistics and JSON import/export support
     # ------------------------------------------------------------------
 
-    def statistics(self):
+    def statistics(
+        self,
+        *,
+        q: str | None = None,
+        jurisdiction: str | None = None,
+        category: str | None = None,
+        agency: str | None = None,
+        record_type: str | None = None,
+        source_id: str | None = None,
+    ):
+        clauses: list[str] = []
+        params: list[object] = []
+        if q:
+            clauses.append("(name LIKE ? OR agency LIKE ? OR category LIKE ? OR jurisdiction LIKE ? OR source_id LIKE ?)")
+            needle = f"%{q}%"
+            params.extend([needle, needle, needle, needle, needle])
+        if jurisdiction:
+            clauses.append("jurisdiction = ?")
+            params.append(jurisdiction)
+        if category:
+            clauses.append("category = ?")
+            params.append(category)
+        if agency:
+            clauses.append("agency = ?")
+            params.append(agency)
+        if source_id:
+            clauses.append("source_id = ?")
+            params.append(source_id)
+
+        api_clauses = clauses + (["record_type = ?"] if record_type in ("api", "catalog") else [])
+        api_params = params + ([record_type] if record_type in ("api", "catalog") else [])
+        if record_type not in ("dataset", "catalog"):
+            api_clauses.append("(record_type IS NULL OR record_type = 'api')")
+        if record_type == "catalog":
+            api_clauses = clauses + ["record_type = 'catalog'"]
+            api_params = params
+
+        dataset_clauses: list[str] = []
+        dataset_params: list[object] = []
+        if q:
+            dataset_clauses.append("(title LIKE ? OR agency LIKE ? OR category LIKE ? OR jurisdiction LIKE ? OR source_id LIKE ?)")
+            needle = f"%{q}%"
+            dataset_params.extend([needle, needle, needle, needle, needle])
+        if jurisdiction:
+            dataset_clauses.append("jurisdiction = ?")
+            dataset_params.append(jurisdiction)
+        if category:
+            dataset_clauses.append("category = ?")
+            dataset_params.append(category)
+        if agency:
+            dataset_clauses.append("agency = ?")
+            dataset_params.append(agency)
+        if source_id:
+            dataset_clauses.append("source_id = ?")
+            dataset_params.append(source_id)
+
         with self.connect() as connection:
-            total = connection.execute("SELECT COUNT(*) FROM api_records").fetchone()[0]
-            datasets = connection.execute("SELECT COUNT(*) FROM datasets").fetchone()[0]
-            sources = connection.execute("SELECT COUNT(DISTINCT source_id) FROM api_records").fetchone()[0]
-            verified = connection.execute("SELECT COUNT(*) FROM api_records WHERE verification_status='healthy'").fetchone()[0]
-            jurisdictions = connection.execute("SELECT jurisdiction,COUNT(*) FROM api_records GROUP BY jurisdiction").fetchall()
-            categories = connection.execute("SELECT category,COUNT(*) FROM api_records GROUP BY category ORDER BY COUNT(*) DESC LIMIT 20").fetchall()
+            api_where = f"WHERE {' AND '.join(api_clauses)}" if api_clauses else ""
+            dataset_where = f"WHERE {' AND '.join(dataset_clauses)}" if dataset_clauses else ""
+            if record_type == "dataset":
+                total = 0
+            else:
+                total = connection.execute(f"SELECT COUNT(*) FROM api_records {api_where}", api_params).fetchone()[0]
+            datasets = 0 if record_type in ("api", "catalog") else connection.execute(
+                f"SELECT COUNT(*) FROM datasets {dataset_where}", dataset_params
+            ).fetchone()[0]
+            if record_type == "dataset":
+                sources = connection.execute(
+                    f"SELECT COUNT(DISTINCT source_id) FROM datasets {dataset_where}", dataset_params
+                ).fetchone()[0]
+            else:
+                api_sources = connection.execute(
+                    f"SELECT COUNT(DISTINCT source_id) FROM api_records {api_where}", api_params
+                ).fetchone()[0]
+                dataset_sources = 0 if record_type in ("api", "catalog") else connection.execute(
+                    f"SELECT COUNT(DISTINCT source_id) FROM datasets {dataset_where}", dataset_params
+                ).fetchone()[0]
+                sources = connection.execute(
+                    f"""
+                    SELECT COUNT(*) FROM (
+                        SELECT source_id FROM api_records {api_where}
+                        UNION
+                        SELECT source_id FROM datasets {dataset_where}
+                    )
+                    """,
+                    api_params + dataset_params,
+                ).fetchone()[0] if record_type not in ("api", "catalog") else api_sources
+            verified_clauses = api_clauses + ["verification_status = 'healthy'"]
+            verified_where = f"WHERE {' AND '.join(verified_clauses)}"
+            verified = connection.execute(
+                f"SELECT COUNT(*) FROM api_records {verified_where}", api_params
+            ).fetchone()[0] if record_type != "dataset" else 0
+            if record_type == "dataset":
+                jurisdictions = connection.execute(
+                    f"SELECT jurisdiction,COUNT(*) FROM datasets {dataset_where} GROUP BY jurisdiction",
+                    dataset_params,
+                ).fetchall()
+                categories = connection.execute(
+                    f"SELECT category,COUNT(*) FROM datasets {dataset_where} GROUP BY category ORDER BY COUNT(*) DESC LIMIT 20",
+                    dataset_params,
+                ).fetchall()
+            elif record_type == "catalog":
+                jurisdictions = connection.execute(
+                    f"SELECT jurisdiction,COUNT(*) FROM api_records {api_where} GROUP BY jurisdiction",
+                    api_params,
+                ).fetchall()
+                categories = connection.execute(
+                    f"SELECT category,COUNT(*) FROM api_records {api_where} GROUP BY category ORDER BY COUNT(*) DESC LIMIT 20",
+                    api_params,
+                ).fetchall()
+            elif record_type == "api":
+                jurisdictions = connection.execute(
+                    f"SELECT jurisdiction,COUNT(*) FROM api_records {api_where} GROUP BY jurisdiction",
+                    api_params,
+                ).fetchall()
+                categories = connection.execute(
+                    f"SELECT category,COUNT(*) FROM api_records {api_where} GROUP BY category ORDER BY COUNT(*) DESC LIMIT 20",
+                    api_params,
+                ).fetchall()
+            else:
+                jurisdiction_where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+                jurisdictions = connection.execute(
+                    f"SELECT jurisdiction,COUNT(*) FROM api_records {jurisdiction_where} GROUP BY jurisdiction",
+                    params,
+                ).fetchall()
+                category_where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+                categories = connection.execute(
+                    f"SELECT category,COUNT(*) FROM api_records {category_where} GROUP BY category ORDER BY COUNT(*) DESC LIMIT 20",
+                    params,
+                ).fetchall()
         return {
             "apis": total,
             "datasets": datasets,
@@ -596,15 +924,134 @@ class RegistryDatabase:
             ],
         }
 
-    def list_sources(self):
+    def list_sources(
+        self,
+        *,
+        q: str | None = None,
+        jurisdiction: str | None = None,
+        category: str | None = None,
+        agency: str | None = None,
+        record_type: str | None = None,
+    ):
+        clauses: list[str] = []
+        params: list[object] = []
+        clauses.append("(record_type IS NULL OR record_type != 'catalog')")
+        if q:
+            clauses.append("(name LIKE ? OR agency LIKE ? OR category LIKE ? OR jurisdiction LIKE ? OR source_id LIKE ?)")
+            needle = f"%{q}%"
+            params.extend([needle, needle, needle, needle, needle])
+        if jurisdiction:
+            clauses.append("jurisdiction = ?")
+            params.append(jurisdiction)
+        if category:
+            clauses.append("category = ?")
+            params.append(category)
+        if agency:
+            clauses.append("agency = ?")
+            params.append(agency)
+        if record_type:
+            if record_type == "catalog":
+                clauses.append("record_type = 'catalog'")
+            elif record_type == "api":
+                clauses.append("(record_type IS NULL OR record_type = 'api')")
         with self.connect() as connection:
-            rows = connection.execute("""
-                SELECT source_id, COUNT(*) AS record_count
-                FROM api_records
-                WHERE record_type IS NULL OR record_type != 'catalog'
-                GROUP BY source_id
-                ORDER BY record_count DESC, source_id
-            """).fetchall()
+            where = f"WHERE {' AND '.join(clauses)}"
+            if record_type == "dataset":
+                dataset_clauses: list[str] = []
+                dataset_params: list[object] = []
+                if q:
+                    dataset_clauses.append("(title LIKE ? OR agency LIKE ? OR category LIKE ? OR jurisdiction LIKE ? OR source_id LIKE ?)")
+                    needle = f"%{q}%"
+                    dataset_params.extend([needle, needle, needle, needle, needle])
+                if jurisdiction:
+                    dataset_clauses.append("jurisdiction = ?")
+                    dataset_params.append(jurisdiction)
+                if category:
+                    dataset_clauses.append("category = ?")
+                    dataset_params.append(category)
+                if agency:
+                    dataset_clauses.append("agency = ?")
+                    dataset_params.append(agency)
+                dataset_where = f"WHERE {' AND '.join(dataset_clauses)}" if dataset_clauses else ""
+                rows = connection.execute(f"""
+                    SELECT source_id, COUNT(*) AS record_count
+                    FROM datasets
+                    {dataset_where}
+                    GROUP BY source_id
+                    ORDER BY record_count DESC, source_id
+                """, dataset_params).fetchall()
+            else:
+                rows = connection.execute(f"""
+                    SELECT source_id, COUNT(*) AS record_count
+                    FROM api_records
+                    {where}
+                    GROUP BY source_id
+                    ORDER BY record_count DESC, source_id
+                """, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_agencies(
+        self,
+        *,
+        q: str | None = None,
+        jurisdiction: str | None = None,
+        category: str | None = None,
+        record_type: str | None = None,
+        source_id: str | None = None,
+    ):
+        clauses: list[str] = ["(record_type IS NULL OR record_type != 'catalog')"]
+        params: list[object] = []
+        if q:
+            clauses.append("(name LIKE ? OR agency LIKE ? OR category LIKE ? OR jurisdiction LIKE ? OR source_id LIKE ?)")
+            needle = f"%{q}%"
+            params.extend([needle, needle, needle, needle, needle])
+        if jurisdiction:
+            clauses.append("jurisdiction = ?")
+            params.append(jurisdiction)
+        if category:
+            clauses.append("category = ?")
+            params.append(category)
+        if record_type:
+            if record_type == "catalog":
+                clauses.append("record_type = 'catalog'")
+            elif record_type == "api":
+                clauses.append("(record_type IS NULL OR record_type = 'api')")
+        if source_id:
+            clauses.append("source_id = ?")
+            params.append(source_id)
+        with self.connect() as connection:
+            if record_type == "dataset":
+                dataset_clauses: list[str] = []
+                dataset_params: list[object] = []
+                if q:
+                    dataset_clauses.append("(title LIKE ? OR agency LIKE ? OR category LIKE ? OR jurisdiction LIKE ? OR source_id LIKE ?)")
+                    needle = f"%{q}%"
+                    dataset_params.extend([needle, needle, needle, needle, needle])
+                if jurisdiction:
+                    dataset_clauses.append("jurisdiction = ?")
+                    dataset_params.append(jurisdiction)
+                if category:
+                    dataset_clauses.append("category = ?")
+                    dataset_params.append(category)
+                if source_id:
+                    dataset_clauses.append("source_id = ?")
+                    dataset_params.append(source_id)
+                dataset_where = f"WHERE {' AND '.join(dataset_clauses)}" if dataset_clauses else ""
+                rows = connection.execute(f"""
+                    SELECT agency, COUNT(*) AS record_count
+                    FROM datasets
+                    {dataset_where}
+                    GROUP BY agency
+                    ORDER BY agency
+                """, dataset_params).fetchall()
+            else:
+                rows = connection.execute(f"""
+                    SELECT agency, COUNT(*) AS record_count
+                    FROM api_records
+                    WHERE {' AND '.join(clauses)}
+                    GROUP BY agency
+                    ORDER BY agency
+                """, params).fetchall()
         return [dict(row) for row in rows]
 
     def import_json(self, records: Iterable[dict], *, source_id: str | None = None) -> int:

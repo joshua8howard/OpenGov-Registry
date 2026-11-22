@@ -102,6 +102,7 @@ class DataGovConnector(CatalogConnector):
             api_kind = self._api_kind(url, resource_format, description)
             if api_kind is None:
                 continue
+            is_dataset = self._is_dataset_resource(url, resource_format, description)
 
             record_id = str(record.get("id") or record.get("identifier") or "unknown")
             base_url = url.rstrip("/")
@@ -147,6 +148,7 @@ class DataGovConnector(CatalogConnector):
                 "source_id": self.source_id,
                 "source_record_id": record_id,
                 "discovered_at": datetime.now(timezone.utc),
+                "record_type": "dataset" if is_dataset else "api",
                 "verification_status": "unverified",
                 "last_seen_at": datetime.now(timezone.utc),
             }))
@@ -190,6 +192,15 @@ class DataGovConnector(CatalogConnector):
         if "/api/" in text or "api.json" in text or "swagger" in text or "openapi" in text:
             return "JSON"
         return None
+
+    @staticmethod
+    def _is_dataset_resource(url: str, resource_format: str, description: str) -> bool:
+        text = f"{url} {description}".lower()
+        format_lower = resource_format.lower()
+        if any(marker in format_lower for marker in ("text/csv", "csv", "excel", "pdf", "zip", "text/plain")):
+            return True
+        path = url.lower().split("?", 1)[0].rstrip("/")
+        return path.endswith(".json") or path.endswith(".xml") or "download" in text
 
     @staticmethod
     def _category(record: dict[str, Any]) -> str:

@@ -10,6 +10,8 @@ This is the 0.3.0 multi-source discovery prototype. It provides:
 - SQLite storage and JSON import
 - A searchable FastAPI public API
 - Data.gov, Socrata, and CKAN catalog connectors
+- Execution connectors for Congress.gov and the Federal Election Commission openFEC API
+- Complete documented Congress.gov route families and openFEC Swagger GET endpoints
 - Canonical duplicate resolution with source-attribution references
 - OpenAPI specification discovery
 - Discovery-run and verification-history persistence
@@ -29,6 +31,14 @@ python -m govapi_registry.cli serve
 
 Open `http://127.0.0.1:8000/docs` for interactive API documentation.
 
+After installation, start the API with the shorter command:
+
+```powershell
+govapi
+```
+
+You can also keep the explicit form:
+
 ## API examples
 
 ```text
@@ -38,6 +48,9 @@ GET /v1/apis?q=spending
 GET /v1/apis?jurisdiction=federal
 GET /v1/apis?category=procurement
 GET /v1/apis/usa-spending
+GET /v1/connectors
+GET /v1/connectors/congress-gov/operations
+POST /v1/connectors/congress-gov/execute
 ```
 
 ## CLI
@@ -60,6 +73,13 @@ $env:DATAGOV_API_KEY = "your-key"
 govapi discover --source datagov --limit 100
 govapi discover --source socrata --limit 100
 govapi discover --source ckan --limit 100 --ckan-url https://demo.ckan.org
+
+# Execute built-in API connectors
+$env:CONGRESS_API_KEY="your-key"
+govapi execute congress bills --params '{"limit":20}'
+
+$env:FEC_API_KEY="your-key"
+govapi execute fec candidates --params '{"state":"NY","office":"H","per_page":20}'
 
 govapi verify usa-spending
 govapi openapi usa-spending

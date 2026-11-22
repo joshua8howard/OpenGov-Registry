@@ -4,7 +4,7 @@ import json
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .database import RegistryDatabase
 from .models import APIRecord, APIRecordCreate, CatalogSource, DatasetRecordCreate
@@ -14,6 +14,22 @@ from .verification import UnsafeURLError, validate_public_url
 class ImportRequest(BaseModel):
     records: list[dict]
     source_id: str | None = None
+
+
+class ConnectorExecutionRequest(BaseModel):
+    operation: str
+    parameters: dict = Field(default_factory=dict)
+    api_key: str | None = None
+
+
+def _get_execution_connector(connector_id: str, api_key: str | None = None):
+    from .connectors import CongressGovConnector, FECConnector
+
+    if connector_id in {"congress-gov", "congress"}:
+        return CongressGovConnector(api_key=api_key)
+    if connector_id in {"fec", "open-fec", "openfec"}:
+        return FECConnector(api_key=api_key)
+    raise HTTPException(status_code=404, detail=f"Unknown connector: {connector_id}")
 
 
 def create_app(database: RegistryDatabase | None = None) -> FastAPI:
@@ -40,8 +56,22 @@ def create_app(database: RegistryDatabase | None = None) -> FastAPI:
         return {"status": "ok", "version": "0.4.0", "records": stats}
 
     @app.get("/v1/statistics", tags=["System"])
-    def statistics() -> dict:
-        return db.statistics()
+    def statistics(
+        q: str | None = None,
+        jurisdiction: str | None = None,
+        category: str | None = None,
+        agency: str | None = None,
+        record_type: str | None = None,
+        source_id: str | None = None,
+    ) -> dict:
+        return db.statistics(
+            q=q,
+            jurisdiction=jurisdiction,
+            category=category,
+            agency=agency,
+            record_type=record_type,
+            source_id=source_id,
+        )
 
     @app.get("/v1/statistics/coverage", tags=["System"])
     def coverage() -> dict:
@@ -49,8 +79,14 @@ def create_app(database: RegistryDatabase | None = None) -> FastAPI:
         return {"jurisdictions": stats["jurisdictions"], "categories": stats["categories"]}
 
     @app.get("/v1/source-facets", tags=["Sources"])
-    def source_facets() -> list[dict[str, object]]:
-        return db.list_sources()
+    def source_facets(
+        q: str | None = None,
+        jurisdiction: str | None = None,
+        category: str | None = None,
+        agency: str | None = None,
+        record_type: str | None = None,
+    ) -> list[dict[str, object]]:
+        return db.list_sources(q=q, jurisdiction=jurisdiction, category=category, agency=agency, record_type=record_type)
 
     @app.get("/v1/sources", tags=["Sources"])
     def sources() -> list[dict]:
@@ -119,6 +155,7 @@ def create_app(database: RegistryDatabase | None = None) -> FastAPI:
         q: str | None = None,
         jurisdiction: str | None = None,
         category: str | None = None,
+        agency: str | None = None,
         record_type: str | None = None,
         source_id: str | None = None,
         limit: int = Query(default=100, ge=1, le=500),
@@ -128,7 +165,28 @@ def create_app(database: RegistryDatabase | None = None) -> FastAPI:
             q=q,
             jurisdiction=jurisdiction,
             category=category,
+            agency=agency,
             record_type=record_type,
+            source_id=source_id,
+            limit=limit,
+            offset=offset,
+        )
+
+    @app.get("/v1/records")
+    def list_records(
+        q: str | None = None,
+        jurisdiction: str | None = None,
+        category: str | None = None,
+        agency: str | None = None,
+        source_id: str | None = None,
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+    ):
+        return db.list_records(
+            q=q,
+            jurisdiction=jurisdiction,
+            category=category,
+            agency=agency,
             source_id=source_id,
             limit=limit,
             offset=offset,
@@ -253,10 +311,12 @@ def create_app(database: RegistryDatabase | None = None) -> FastAPI:
         q: str | None = None,
         jurisdiction: str | None = None,
         category: str | None = None,
+        agency: str | None = None,
+        source_id: str | None = None,
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
     ):
-        return db.list_datasets(q=q, jurisdiction=jurisdiction, category=category, limit=limit, offset=offset)
+        return db.list_datasets(q=q, jurisdiction=jurisdiction, category=category, agency=agency, source_id=source_id, limit=limit, offset=offset)
 
     @app.post("/v1/datasets", status_code=201, tags=["Datasets"])
     def create_dataset(payload: DatasetRecordCreate):
@@ -298,6 +358,22 @@ def create_app(database: RegistryDatabase | None = None) -> FastAPI:
     def agencies() -> list[str]:
         return sorted({row.agency for row in db.list(limit=5000)})
 
+    @app.get("/v1/agency-facets", tags=["Reference Data"])
+    def agency_facets(
+        q: str | None = None,
+        jurisdiction: str | None = None,
+        category: str | None = None,
+        record_type: str | None = None,
+        source_id: str | None = None,
+    ) -> list[dict[str, object]]:
+        return db.list_agencies(
+            q=q,
+            jurisdiction=jurisdiction,
+            category=category,
+            record_type=record_type,
+            source_id=source_id,
+        )
+
     @app.get("/v1/categories", tags=["Reference Data"])
     def categories() -> list[str]:
         stats = db.statistics()
@@ -310,6 +386,76 @@ def create_app(database: RegistryDatabase | None = None) -> FastAPI:
     @app.get("/v1/authentication-methods", tags=["Reference Data"])
     def authentication_methods() -> list[str]:
         return ["none", "api_key", "oauth2", "basic", "unknown"]
+
+    @app.get("/v1/connectors", tags=["Connectors"])
+    def list_connectors() -> list[dict[str, object]]:
+        from .connectors import CongressGovConnector, FECConnector
+
+        congress = CongressGovConnector()
+        fec = FECConnector()
+        try:
+            fec.discover_operations()
+        except RuntimeError:
+            pass
+        connectors = (congress, fec)
+        return [
+            {
+                "id": connector.connector_id,
+                "name": "Congress.gov" if connector.connector_id == "congress-gov" else "Federal Election Commission",
+                "base_url": connector.base_url,
+                "authentication": "api_key",
+                "operations": sorted(connector.operations),
+            }
+            for connector in connectors
+        ]
+
+    @app.get("/v1/connectors/{connector_id}/operations", tags=["Connectors"])
+    def connector_operations(connector_id: str) -> dict[str, object]:
+        connector = _get_execution_connector(connector_id)
+        connector.discover_operations()
+        return {
+            "connector_id": connector.connector_id,
+            "base_url": connector.base_url,
+            "operations": [
+                {"name": name, "path": path}
+                for name, path in sorted(connector.operations.items())
+            ],
+        }
+
+    @app.post("/v1/connectors/{connector_id}/execute", tags=["Connectors"])
+    def execute_connector(connector_id: str, payload: ConnectorExecutionRequest) -> dict[str, object]:
+        from .connectors import (
+            ConnectorAuthenticationError,
+            ConnectorOperationError,
+            ConnectorUpstreamError,
+        )
+
+        try:
+            connector = _get_execution_connector(connector_id, api_key=payload.api_key)
+            raw = connector.execute(payload.operation, payload.parameters)
+            normalized = connector.normalize_response(raw)
+            pagination = normalized.get("pagination")
+            if isinstance(pagination, dict):
+                pagination = {
+                    **pagination,
+                    "requested": {
+                        key: payload.parameters[key]
+                        for key in ("page", "offset", "limit", "per_page")
+                        if key in payload.parameters
+                    },
+                }
+                normalized["pagination"] = pagination
+            return {
+                "connector_id": connector_id,
+                "operation": payload.operation,
+                "status": "ok",
+                "response": raw,
+                "normalized": normalized,
+            }
+        except (ConnectorAuthenticationError, ConnectorOperationError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ConnectorUpstreamError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return app
 

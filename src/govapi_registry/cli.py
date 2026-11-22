@@ -6,8 +6,11 @@ from .database import RegistryDatabase
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="govapi", description="GovAPI Registry tools")
-    subcommands = parser.add_subparsers(dest="command", required=True)
+    parser = argparse.ArgumentParser(
+        prog="govapi",
+        description="GovAPI Registry tools. Run without a subcommand to start the API.",
+    )
+    subcommands = parser.add_subparsers(dest="command")
 
     import_parser = subcommands.add_parser("import", help="Import API records from JSON")
     import_parser.add_argument("file", type=Path)
@@ -35,13 +38,23 @@ def main() -> None:
     openapi_parser.add_argument("record_id")
     openapi_parser.add_argument("--database", default="registry.db")
 
+    execute_parser = subcommands.add_parser("execute", help="Execute a built-in government API connector")
+    execute_parser.add_argument("connector", choices=["congress", "fec"])
+    execute_parser.add_argument("operation")
+    execute_parser.add_argument("--params", default="{}", help="JSON request parameters")
+    execute_parser.add_argument("--api-key")
+
     serve_parser = subcommands.add_parser("serve", help="Run the API server")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8000)
 
     args = parser.parse_args()
 
-    if args.command == "reset":
+    if args.command is None:
+        import uvicorn
+        uvicorn.run("govapi_registry.api:app", host="127.0.0.1", port=8000)
+
+    elif args.command == "reset":
         db_path = Path(args.database)
         if db_path.exists():
             db_path.unlink()
@@ -111,6 +124,32 @@ def main() -> None:
         if result:
             db.set_openapi_spec(record.id, result["openapi_spec_url"])
         print(json.dumps(result))
+
+    elif args.command == "execute":
+        from .connectors import CongressGovConnector, FECConnector
+
+        try:
+            parameters = json.loads(args.params)
+        except json.JSONDecodeError as exc:
+            parser.error(f"Invalid --params JSON: {exc}")
+        if not isinstance(parameters, dict):
+            parser.error("--params must be a JSON object")
+
+        connector = (
+            CongressGovConnector(api_key=args.api_key)
+            if args.connector == "congress"
+            else FECConnector(api_key=args.api_key)
+        )
+        try:
+            response = connector.execute(args.operation, parameters)
+        except Exception as exc:
+            parser.error(str(exc))
+        print(json.dumps({
+            "connector_id": connector.connector_id,
+            "operation": args.operation,
+            "response": response,
+            "normalized": connector.normalize_response(response),
+        }, default=str))
 
     elif args.command == "serve":
         import uvicorn
